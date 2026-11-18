@@ -1,0 +1,570 @@
+namespace Z42Battle;
+
+// Battle kernel. Must match go/sim.go and rust/src/sim.rs:
+//
+// Integer world, no floats. One splitmix64 stream per room.
+// Each tick every player consumes exactly 3 RNG values (dx, dy, cast), even if dead.
+// Tick order:
+//   1. movement + skill (spawn projectile; new projectile does not move this tick)
+//   2. existing projectiles move, first manhattan hit in player-id order
+//   3. apply damage event list in append order (hp damage + DoT buff)
+//   4. tick buffs in list order, then compact
+//   5. allocate a fresh snapshot and mix into room hash
+//
+// z42 note: `ulong` arithmetic (xor/shift) is not usable in 0.7.0, so the 64-bit
+// bit patterns are carried in `long` and every unsigned shift goes through
+// Kernel.LShr. Arithmetic still wraps modulo 2^64 exactly like Go's uint64.
+public static class Kernel {
+    public const long MapW = 10000;
+    public const long MapH = 10000;
+    public const long PlayerHP = 1000;
+    public const long HitRadius = 150;
+    public const long ProjSpeed = 200;
+    public const long ProjTTL = 20;
+    public const long SkillCooldown = 10;
+    public const long DotTicks = 5;
+    public const long DotDamage = 2;
+    public const long ProjDamage = 8;
+
+    public const long HashOffset = 0xcbf29ce484222325;
+    public const long Golden = 0x9e3779b97f4a7c15;
+    public const long MixMul = 0xbf58476d1ce4e5b9;
+    public const long MixMul2 = 0x94d049bb133366eb;
+
+    public const long TickBudgetUs = 50000;
+    public const int WarmupTicks = 20;
+
+    /// Logical right shift of a 64-bit two's-complement value.
+    public static long LShr(long x, int n) {
+        if (n <= 0) { return x; }
+        long mask = (1L << (64 - n)) - 1L;
+        return (x >> n) & mask;
+    }
+
+    /// (2^64) mod d, used to fold signed remainders back into unsigned modulo.
+    public static long Pow2Mod(long d) {
+        long c = 1;
+        for (int i = 0; i < 64; i++) {
+            c = (c * 2) % d;
+        }
+        return c;
+    }
+
+    /// Unsigned 64-bit `x % d` where x is a signed bit pattern and d > 0.
+    public static long UMod(long x, long d, long pow2mod) {
+        if (x >= 0) { return x % d; }
+        long r = x % d;   // in (-d, 0]
+        long t = r + pow2mod;
+        if (t < 0) { t = t + d; }
+        if (t >= d) { t = t - d; }
+        return t;
+    }
+
+    public static long Abs32(long v) {
+        if (v < 0) { return -v; }
+        return v;
+    }
+
+    public static long Sign32(long v) {
+        if (v > 0) { return 1; }
+        if (v < 0) { return -1; }
+        return 0;
+    }
+
+    public static long Clamp(long v, long lo, long hi) {
+        if (v < lo) { return lo; }
+        if (v > hi) { return hi; }
+        return v;
+    }
+
+    public static long Manhattan(long x1, long y1, long x2, long y2) {
+        return Abs32(x1 - x2) + Abs32(y1 - y2);
+    }
+
+    public static long Mix(long h, long x) {
+        x = x ^ Golden;
+        x = x * MixMul;
+        x = x ^ LShr(x, 27);
+        h = h ^ x;
+        h = h * Golden;
+        return h;
+    }
+
+    /// Mix a 32-bit value, zero-extended exactly like Go's uint32 cast.
+    public static long MixI32(long h, long v) {
+        return Mix(h, v & 0xFFFFFFFFL);
+    }
+
+    public static long CastMod(string workload) {
+        if (workload == "low") { return 50; }
+        if (workload == "medium") { return 10; }
+        if (workload == "high") { return 3; }
+        if (workload == "insane") { return 1; }
+        return 0;
+    }
+}
+
+public class Rng {
+    public long State;
+
+    public Rng(long seed) {
+        this.State = seed;
+    }
+
+    public long Next() {
+        this.State = this.State + Kernel.Golden;
+        long z = this.State;
+        z = (z ^ Kernel.LShr(z, 30)) * Kernel.MixMul;
+        z = (z ^ Kernel.LShr(z, 27)) * Kernel.MixMul2;
+        return z ^ Kernel.LShr(z, 31);
+    }
+}
+
+public class Player {
+    public long Id;
+    public long Team;
+    public long X;
+    public long Y;
+    public long Hp;
+    public long Cooldown;
+    public bool Alive;
+}
+
+public class Projectile {
+    public long Id;
+    public long OwnerID;
+    public long OwnerTeam;
+    public long X;
+    public long Y;
+    public long Vx;
+    public long Vy;
+    public long Ttl;
+    public bool Alive;
+}
+
+public class Buff {
+    public long TargetID;
+    public long Remaining;
+}
+
+public class DamageEvent {
+    public long SourceID;
+    public long TargetID;
+    public long Amount;
+}
+
+public class Snap {
+    public long Id;
+    public long X;
+    public long Y;
+    public long Hp;
+    public long Alive;
+}
+
+/// One room: fixed player set + projectile / buff / event / snapshot storage.
+/// `Arena` decides whether the short-lived objects are recycled (arena) or
+/// allocated fresh per use and left for the GC (naive).
+public class Room {
+    public bool Arena;
+    public Rng Rng;
+    public Player[] Players;
+    public Projectile[] Projs;
+    public int ProjCount;
+    public Projectile[] ProjFree;
+    public int ProjFreeCount;
+    public Buff[] Buffs;
+    public int BuffCount;
+    public Buff[] BuffFree;
+    public int BuffFreeCount;
+    public DamageEvent[] Events;
+    public int EventCount;
+    public Snap[] SnapBuf;
+    public long NextProjID;
+    public long DamageTotal;
+    public long Hash;
+    public long Pow7;
+    public long PowCmod;
+
+    public Room(long seed, long roomID, int nPlayers, bool arena, long cmod) {
+        this.Arena = arena;
+        this.Rng = new Rng(RoomSeed(seed, roomID));
+        this.Players = new Player[nPlayers];
+        this.Projs = new Projectile[64];
+        this.Buffs = new Buff[64];
+        this.Events = new DamageEvent[64];
+        this.SnapBuf = new Snap[nPlayers];
+        this.ProjCount = 0;
+        this.ProjFree = new Projectile[64];
+        this.ProjFreeCount = 0;
+        this.BuffCount = 0;
+        this.BuffFree = new Buff[64];
+        this.BuffFreeCount = 0;
+        this.EventCount = 0;
+        this.NextProjID = 1;
+        this.DamageTotal = 0;
+        this.Hash = Kernel.HashOffset;
+        this.Pow7 = Kernel.Pow2Mod(7);
+        this.PowCmod = Kernel.Pow2Mod(cmod);
+
+        long half = nPlayers / 2;
+        for (int i = 0; i < nPlayers; i++) {
+            long id = i + 1;
+            long team = 1;
+            long idxInTeam = i;
+            long x = 3500;
+            if (id > half) {
+                team = 2;
+                idxInTeam = i - half;
+                x = 6500;
+            }
+            Player p = new Player();
+            p.Id = id;
+            p.Team = team;
+            p.X = x;
+            p.Y = 500 + idxInTeam * 400;
+            p.Hp = Kernel.PlayerHP;
+            p.Cooldown = 0;
+            p.Alive = true;
+            this.Players[i] = p;
+            this.SnapBuf[i] = new Snap();
+        }
+    }
+
+    public static long RoomSeed(long seed, long roomID) {
+        long s = seed ^ (roomID * Kernel.Golden);
+        Rng r = new Rng(s);
+        return r.Next();
+    }
+
+    /// -1 when no living enemy exists.
+    public int NearestEnemy(int selfIdx) {
+        Player self = this.Players[selfIdx];
+        int best = -1;
+        long bestDist = 1L << 30;
+        long bestID = 0;
+        for (int i = 0; i < this.Players.Length; i++) {
+            Player p = this.Players[i];
+            if (!p.Alive) { continue; }
+            if (p.Team == self.Team) { continue; }
+            long d = Kernel.Manhattan(self.X, self.Y, p.X, p.Y);
+            if (best < 0) {
+                best = i;
+                bestDist = d;
+                bestID = p.Id;
+                continue;
+            }
+            if (d < bestDist) {
+                best = i;
+                bestDist = d;
+                bestID = p.Id;
+                continue;
+            }
+            if (d == bestDist && p.Id < bestID) {
+                best = i;
+                bestID = p.Id;
+            }
+        }
+        return best;
+    }
+
+    public void SpawnProj(Player src, Player tgt) {
+        long dx = tgt.X - src.X;
+        long dy = tgt.Y - src.Y;
+        long vx = 0;
+        long vy = 0;
+        if (Kernel.Abs32(dx) >= Kernel.Abs32(dy)) {
+            vx = Kernel.Sign32(dx) * Kernel.ProjSpeed;
+        } else {
+            vy = Kernel.Sign32(dy) * Kernel.ProjSpeed;
+        }
+        Projectile p;
+        if (this.Arena && this.ProjFreeCount > 0) {
+            this.ProjFreeCount = this.ProjFreeCount - 1;
+            p = this.ProjFree[this.ProjFreeCount];
+            this.ProjFree[this.ProjFreeCount] = null;
+        } else {
+            p = new Projectile();
+        }
+        p.Id = this.NextProjID;
+        p.OwnerID = src.Id;
+        p.OwnerTeam = src.Team;
+        p.X = src.X;
+        p.Y = src.Y;
+        p.Vx = vx;
+        p.Vy = vy;
+        p.Ttl = Kernel.ProjTTL;
+        p.Alive = true;
+        this.PutProj(p);
+        this.NextProjID = this.NextProjID + 1;
+    }
+
+    private void PutProj(Projectile p) {
+        if (this.ProjCount >= this.Projs.Length) {
+            this.GrowProjs();
+        }
+        this.Projs[this.ProjCount] = p;
+        this.ProjCount = this.ProjCount + 1;
+    }
+
+    private void GrowProjs() {
+        int n = this.Projs.Length * 2;
+        Projectile[] bigger = new Projectile[n];
+        for (int i = 0; i < this.Projs.Length; i++) {
+            bigger[i] = this.Projs[i];
+        }
+        this.Projs = bigger;
+    }
+
+    public void CompactProj() {
+        int n = 0;
+        int old = this.ProjCount;
+        for (int i = 0; i < old; i++) {
+            Projectile p = this.Projs[i];
+            if (p.Alive) {
+                if (i != n) { this.Projs[n] = p; }
+                n = n + 1;
+            } else if (this.Arena) {
+                this.PushProjFree(p);
+            }
+        }
+        for (int i = n; i < old; i++) {
+            this.Projs[i] = null;
+        }
+        this.ProjCount = n;
+    }
+
+    private void PushProjFree(Projectile p) {
+        if (this.ProjFreeCount >= this.ProjFree.Length) {
+            int cap = this.ProjFree.Length * 2;
+            Projectile[] bigger = new Projectile[cap];
+            for (int i = 0; i < this.ProjFree.Length; i++) { bigger[i] = this.ProjFree[i]; }
+            this.ProjFree = bigger;
+        }
+        this.ProjFree[this.ProjFreeCount] = p;
+        this.ProjFreeCount = this.ProjFreeCount + 1;
+    }
+
+    public void AddBuff(long targetID) {
+        Buff b;
+        if (this.Arena && this.BuffFreeCount > 0) {
+            this.BuffFreeCount = this.BuffFreeCount - 1;
+            b = this.BuffFree[this.BuffFreeCount];
+            this.BuffFree[this.BuffFreeCount] = null;
+        } else {
+            b = new Buff();
+        }
+        b.TargetID = targetID;
+        b.Remaining = Kernel.DotTicks;
+        if (this.BuffCount >= this.Buffs.Length) {
+            this.GrowBuffs();
+        }
+        this.Buffs[this.BuffCount] = b;
+        this.BuffCount = this.BuffCount + 1;
+    }
+
+    private void GrowBuffs() {
+        int n = this.Buffs.Length * 2;
+        Buff[] bigger = new Buff[n];
+        for (int i = 0; i < this.Buffs.Length; i++) {
+            bigger[i] = this.Buffs[i];
+        }
+        this.Buffs = bigger;
+    }
+
+    public void CompactBuff() {
+        int n = 0;
+        int old = this.BuffCount;
+        for (int i = 0; i < old; i++) {
+            Buff b = this.Buffs[i];
+            if (b.Remaining > 0) {
+                if (i != n) { this.Buffs[n] = b; }
+                n = n + 1;
+            } else if (this.Arena) {
+                this.PushBuffFree(b);
+            }
+        }
+        for (int i = n; i < old; i++) {
+            this.Buffs[i] = null;
+        }
+        this.BuffCount = n;
+    }
+
+    private void PushBuffFree(Buff b) {
+        if (this.BuffFreeCount >= this.BuffFree.Length) {
+            int cap = this.BuffFree.Length * 2;
+            Buff[] bigger = new Buff[cap];
+            for (int i = 0; i < this.BuffFree.Length; i++) { bigger[i] = this.BuffFree[i]; }
+            this.BuffFree = bigger;
+        }
+        this.BuffFree[this.BuffFreeCount] = b;
+        this.BuffFreeCount = this.BuffFreeCount + 1;
+    }
+
+    public void AddEvent(long sourceID, long targetID, long amount) {
+        DamageEvent e;
+        if (this.Arena && this.EventCount < this.Events.Length && this.Events[this.EventCount] != null) {
+            e = this.Events[this.EventCount];
+        } else {
+            e = new DamageEvent();
+        }
+        e.SourceID = sourceID;
+        e.TargetID = targetID;
+        e.Amount = amount;
+        if (this.EventCount >= this.Events.Length) {
+            this.GrowEvents();
+        }
+        this.Events[this.EventCount] = e;
+        this.EventCount = this.EventCount + 1;
+    }
+
+    private void GrowEvents() {
+        int n = this.Events.Length * 2;
+        DamageEvent[] bigger = new DamageEvent[n];
+        for (int i = 0; i < this.Events.Length; i++) {
+            bigger[i] = this.Events[i];
+        }
+        this.Events = bigger;
+    }
+
+    public void ApplyDamage(long targetID, long amount) {
+        Player p = this.Players[targetID - 1];
+        if (!p.Alive) { return; }
+        p.Hp = p.Hp - amount;
+        this.DamageTotal = this.DamageTotal + amount;
+        if (p.Hp <= 0) {
+            p.Hp = 0;
+            p.Alive = false;
+        }
+    }
+
+    public void Tick(long cmod) {
+        // 1. movement + skill
+        for (int i = 0; i < this.Players.Length; i++) {
+            Player p = this.Players[i];
+            long dx = Kernel.UMod(this.Rng.Next(), 7, this.Pow7) - 3;
+            long dy = Kernel.UMod(this.Rng.Next(), 7, this.Pow7) - 3;
+            bool want = Kernel.UMod(this.Rng.Next(), cmod, this.PowCmod) == 0;
+            if (!p.Alive) { continue; }
+            p.X = Kernel.Clamp(p.X + dx, 0, Kernel.MapW);
+            p.Y = Kernel.Clamp(p.Y + dy, 0, Kernel.MapH);
+            if (p.Cooldown > 0) {
+                p.Cooldown = p.Cooldown - 1;
+            }
+            if (want && p.Cooldown == 0) {
+                int tgt = this.NearestEnemy(i);
+                if (tgt >= 0) {
+                    this.SpawnProj(p, this.Players[tgt]);
+                    p.Cooldown = Kernel.SkillCooldown;
+                }
+            }
+        }
+
+        // 2. projectiles move and hit
+        this.EventCount = 0;
+        for (int i = 0; i < this.ProjCount; i++) {
+            Projectile pr = this.Projs[i];
+            if (!pr.Alive) { continue; }
+            pr.X = Kernel.Clamp(pr.X + pr.Vx, 0, Kernel.MapW);
+            pr.Y = Kernel.Clamp(pr.Y + pr.Vy, 0, Kernel.MapH);
+            pr.Ttl = pr.Ttl - 1;
+            for (int j = 0; j < this.Players.Length; j++) {
+                Player t = this.Players[j];
+                if (!t.Alive) { continue; }
+                if (t.Team == pr.OwnerTeam) { continue; }
+                if (Kernel.Manhattan(pr.X, pr.Y, t.X, t.Y) <= Kernel.HitRadius) {
+                    this.AddEvent(pr.OwnerID, t.Id, Kernel.ProjDamage);
+                    pr.Alive = false;
+                    break;
+                }
+            }
+            if (pr.Ttl <= 0) {
+                pr.Alive = false;
+            }
+        }
+        this.CompactProj();
+
+        // 3. damage events in append order
+        for (int i = 0; i < this.EventCount; i++) {
+            DamageEvent e = this.Events[i];
+            this.ApplyDamage(e.TargetID, e.Amount);
+            this.AddBuff(e.TargetID);
+        }
+
+        // 4. DoT buffs
+        int nBuff = this.BuffCount;
+        for (int i = 0; i < nBuff; i++) {
+            Buff b = this.Buffs[i];
+            this.ApplyDamage(b.TargetID, Kernel.DotDamage);
+            b.Remaining = b.Remaining - 1;
+        }
+        this.CompactBuff();
+
+        // 5. snapshot + hash
+        this.FillSnap();
+        this.MixWorld();
+    }
+
+    private void FillSnap() {
+        for (int i = 0; i < this.Players.Length; i++) {
+            Player p = this.Players[i];
+            Snap s;
+            if (this.Arena) {
+                s = this.SnapBuf[i];
+            } else {
+                s = new Snap();
+                this.SnapBuf[i] = s;
+            }
+            s.Id = p.Id;
+            s.X = p.X;
+            s.Y = p.Y;
+            s.Hp = p.Hp;
+            if (p.Alive) {
+                s.Alive = 1;
+            } else {
+                s.Alive = 0;
+            }
+        }
+    }
+
+    private void MixWorld() {
+        long h = this.Hash;
+        for (int i = 0; i < this.SnapBuf.Length; i++) {
+            Snap s = this.SnapBuf[i];
+            h = Kernel.Mix(h, s.Id);
+            h = Kernel.MixI32(h, s.X);
+            h = Kernel.MixI32(h, s.Y);
+            h = Kernel.MixI32(h, s.Hp);
+            h = Kernel.Mix(h, s.Alive);
+        }
+        for (int i = 0; i < this.Players.Length; i++) {
+            Player p = this.Players[i];
+            h = Kernel.MixI32(h, p.Cooldown);
+            h = Kernel.Mix(h, p.Team);
+        }
+        for (int i = 0; i < this.ProjCount; i++) {
+            Projectile pr = this.Projs[i];
+            h = Kernel.Mix(h, pr.Id);
+            h = Kernel.MixI32(h, pr.X);
+            h = Kernel.MixI32(h, pr.Y);
+            h = Kernel.MixI32(h, pr.Vx);
+            h = Kernel.MixI32(h, pr.Vy);
+            h = Kernel.MixI32(h, pr.Ttl);
+            h = Kernel.Mix(h, pr.OwnerID);
+        }
+        for (int i = 0; i < this.BuffCount; i++) {
+            Buff b = this.Buffs[i];
+            h = Kernel.Mix(h, b.TargetID);
+            h = Kernel.MixI32(h, b.Remaining);
+        }
+        h = Kernel.Mix(h, this.DamageTotal);
+        this.Hash = h;
+    }
+
+    public long AliveCount() {
+        long n = 0;
+        for (int i = 0; i < this.Players.Length; i++) {
+            if (this.Players[i].Alive) { n = n + 1; }
+        }
+        return n;
+    }
+}

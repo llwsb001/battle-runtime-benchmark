@@ -1,0 +1,307 @@
+namespace Z42Battle;
+
+using Std.Collections;
+using Std.Diagnostics;
+using Std.IO;
+using Std.Threading;
+
+public class Config {
+    public long Seed = 1234;
+    public int Rooms = 1;
+    public int Players = 40;
+    public int Ticks = 200;
+    public string Workload = "medium";
+    public string Alloc = "naive";
+    public bool Arena = false;
+    public long CastMod = 10;
+    public long SpinNs = 1000000;
+}
+
+public class RoomOut {
+    public long Hash;
+    public long Damage;
+    public long Alive;
+    public List<long> Lags;
+    public List<long> Computes;
+}
+
+public class Stats {
+    public long P50;
+    public long P99;
+    public long P999;
+    public long Max;
+    public long Missed50;
+    public long Missed100;
+    public long Missed200;
+}
+
+public static class Program {
+    public static void Main() {
+        Config cfg = ParseArgs(Environment.GetCommandLineArgs());
+        string json = Run(cfg);
+        Console.WriteLine(json);
+    }
+
+    private static Config Fail(string msg) {
+        ConsoleError.WriteLine("z42-battle: " + msg);
+        Environment.Exit(2);
+        return new Config();
+    }
+
+    private static Config ParseArgs(string[] args) {
+        Config cfg = new Config();
+        for (int i = 0; i < args.Length; i++) {
+            string k = args[i];
+            if (k == "--help" || k == "-h") {
+                Console.WriteLine("z42-battle --rooms N --players N --ticks N --seed N --workload low|medium|high|insane --alloc naive|arena [--spin-us N]");
+                Environment.Exit(0);
+            }
+            if (i + 1 >= args.Length) {
+                return Fail("missing value for " + k);
+            }
+            string v = args[i + 1];
+            if (k == "--rooms") {
+                cfg.Rooms = (int)Int64.Parse(v);
+            } else if (k == "--players") {
+                cfg.Players = (int)Int64.Parse(v);
+            } else if (k == "--ticks") {
+                cfg.Ticks = (int)Int64.Parse(v);
+            } else if (k == "--seed") {
+                cfg.Seed = Int64.Parse(v);
+            } else if (k == "--workload") {
+                cfg.Workload = v;
+            } else if (k == "--alloc") {
+                cfg.Alloc = v;
+            } else if (k == "--spin-us") {
+                cfg.SpinNs = Int64.Parse(v) * 1000;
+            } else {
+                return Fail("unknown flag " + k);
+            }
+            i = i + 1;
+        }
+        if (cfg.Rooms < 1 || cfg.Players < 2 || cfg.Ticks < 1) {
+            return Fail("rooms, players, ticks must be positive (players >= 2)");
+        }
+        cfg.CastMod = Kernel.CastMod(cfg.Workload);
+        if (cfg.CastMod == 0) {
+            return Fail("unknown workload " + cfg.Workload);
+        }
+        if (cfg.Alloc == "arena") {
+            cfg.Arena = true;
+        } else if (cfg.Alloc == "naive") {
+            cfg.Arena = false;
+        } else {
+            return Fail("unknown alloc " + cfg.Alloc);
+        }
+        if (cfg.SpinNs < 0) {
+            cfg.SpinNs = 0;
+        }
+        return cfg;
+    }
+
+    private static void WaitUntil(long due, long spinNs) {
+        long now = Clock.MonoNanos();
+        if (now >= due) {
+            // late: give the scheduler a chance, like runtime.Gosched() in the Go build
+            Thread.Sleep(0);
+            return;
+        }
+        while (true) {
+            long rem = due - Clock.MonoNanos();
+            if (rem <= 0) { return; }
+            if (rem > spinNs) {
+                long ms = (rem - spinNs) / 1000000L;
+                if (ms > 0) {
+                    Thread.Sleep(ms);
+                }
+            }
+        }
+    }
+
+    private static RoomOut SimulateRoom(Config cfg, long roomID, long startNs) {
+        Room rm = new Room(cfg.Seed, roomID, cfg.Players, cfg.Arena, cfg.CastMod);
+        bool skipWarmup = cfg.Ticks > Kernel.WarmupTicks;
+        long interval = Kernel.TickBudgetUs * 1000L;
+        RoomOut res = new RoomOut();
+        res.Hash = 0;
+        res.Damage = 0;
+        res.Alive = 0;
+        res.Lags = new List<long>(cfg.Ticks);
+        res.Computes = new List<long>(cfg.Ticks);
+        for (int t = 0; t < cfg.Ticks; t++) {
+            long due = startNs + (long)t * interval;
+            WaitUntil(due, cfg.SpinNs);
+            long t0 = Clock.MonoNanos();
+            rm.Tick(cfg.CastMod);
+            long done = Clock.MonoNanos();
+            long lag = (done - due) / 1000L;
+            if (lag < 0) { lag = 0; }
+            long compute = (done - t0) / 1000L;
+            if (!skipWarmup || t >= Kernel.WarmupTicks) {
+                res.Lags.Add(lag);
+                res.Computes.Add(compute);
+            }
+        }
+        res.Hash = rm.Hash;
+        res.Damage = rm.DamageTotal;
+        res.Alive = rm.AliveCount();
+        return res;
+    }
+
+    private static long Percentile(List<long> sorted, long permille) {
+        int n = sorted.Count;
+        if (n == 0) { return 0; }
+        long idx = ((long)(n - 1) * permille) / 1000L;
+        return sorted[(int)idx];
+    }
+
+    private static Stats Summarize(List<long> samples) {
+        samples.Sort();
+        Stats s = new Stats();
+        s.P50 = Percentile(samples, 500);
+        s.P99 = Percentile(samples, 990);
+        s.P999 = Percentile(samples, 999);
+        s.Max = 0;
+        s.Missed50 = 0;
+        s.Missed100 = 0;
+        s.Missed200 = 0;
+        for (int i = 0; i < samples.Count; i++) {
+            long us = samples[i];
+            if (us > s.Max) { s.Max = us; }
+            if (us > Kernel.TickBudgetUs) { s.Missed50 = s.Missed50 + 1; }
+            if (us > 100000L) { s.Missed100 = s.Missed100 + 1; }
+            if (us > 200000L) { s.Missed200 = s.Missed200 + 1; }
+        }
+        return s;
+    }
+
+    private static string Hex16(long v) {
+        string digits = "0123456789abcdef";
+        string s = "";
+        for (int i = 15; i >= 0; i--) {
+            int nib = (int)((v >> (4 * i)) & 15L);
+            s = s + digits.Substring(nib, 1);
+        }
+        return s;
+    }
+
+    private static string Pad6(long v) {
+        string s = v.ToString();
+        while (s.Length < 6) { s = "0" + s; }
+        return s;
+    }
+
+    private static long ReadVmHwmBytes() {
+        try {
+            string status = File.ReadAllText("/proc/self/status");
+            int idx = status.IndexOf("VmHWM:");
+            if (idx < 0) { return 0; }
+            string rest = status.Substring(idx + 6).Trim();
+            string[] parts = rest.Split(" ");
+            long kb = Int64.Parse(parts[0]);
+            return kb * 1024L;
+        } catch {
+            return 0;
+        }
+    }
+
+    /// utime + stime from /proc/self/stat, converted with USER_HZ = 100.
+    private static long ReadCpuMicros() {
+        try {
+            string stat = File.ReadAllText("/proc/self/stat");
+            int close = stat.IndexOf(")");
+            string rest = stat.Substring(close + 2).Trim();
+            string[] f = rest.Split(" ");
+            long utime = Int64.Parse(f[11]);
+            long stime = Int64.Parse(f[12]);
+            return (utime + stime) * 10000L;
+        } catch {
+            return 0;
+        }
+    }
+
+    private static string CpuSeconds(long micros) {
+        long whole = micros / 1000000L;
+        long frac = micros % 1000000L;
+        return whole.ToString() + "." + Pad6(frac);
+    }
+
+    private static string Run(Config cfg) {
+        RuntimeCounters c0 = RuntimeStats.Counters();
+        long startNs = Clock.MonoNanos();
+
+        RoomOut[] outs = new RoomOut[cfg.Rooms];
+        Thread[] threads = new Thread[cfg.Rooms];
+        for (int i = 0; i < cfg.Rooms; i++) {
+            int idx = i;
+            long roomID = (long)(i + 1);
+            threads[i] = Thread.Start(() => {
+                outs[idx] = SimulateRoom(cfg, roomID, startNs);
+            });
+        }
+        for (int i = 0; i < cfg.Rooms; i++) {
+            threads[i].Join();
+        }
+
+        List<long> lags = new List<long>(cfg.Rooms * cfg.Ticks);
+        List<long> computes = new List<long>(cfg.Rooms * cfg.Ticks);
+        long worldHash = Kernel.HashOffset;
+        long damage = 0;
+        long alive = 0;
+        for (int i = 0; i < cfg.Rooms; i++) {
+            RoomOut o = outs[i];
+            worldHash = Kernel.Mix(worldHash, o.Hash);
+            damage = damage + o.Damage;
+            alive = alive + o.Alive;
+            lags.AddRange(o.Lags.ToArray());
+            computes.AddRange(o.Computes.ToArray());
+        }
+
+        RuntimeCounters c1 = RuntimeStats.Counters();
+        long rss = ReadVmHwmBytes();
+        long cpuUs = ReadCpuMicros();
+        Stats lagS = Summarize(lags);
+        Stats compS = Summarize(computes);
+
+        string nl = "\n";
+        string sb = "{" + nl;
+        sb = sb + "  \"lang\": \"z42\"," + nl;
+        sb = sb + "  \"alloc\": \"" + cfg.Alloc + "\"," + nl;
+        sb = sb + "  \"ticks\": " + cfg.Ticks.ToString() + "," + nl;
+        sb = sb + "  \"seed\": " + cfg.Seed.ToString() + "," + nl;
+        sb = sb + "  \"rooms\": " + cfg.Rooms.ToString() + "," + nl;
+        sb = sb + "  \"players\": " + cfg.Players.ToString() + "," + nl;
+        sb = sb + "  \"workload\": \"" + cfg.Workload + "\"," + nl;
+        sb = sb + "  \"world_hash\": \"" + Hex16(worldHash) + "\"," + nl;
+        sb = sb + "  \"damage_total\": " + damage.ToString() + "," + nl;
+        sb = sb + "  \"alive_players\": " + alive.ToString() + "," + nl;
+        sb = sb + "  \"tick_p50_us\": " + lagS.P50.ToString() + "," + nl;
+        sb = sb + "  \"tick_p99_us\": " + lagS.P99.ToString() + "," + nl;
+        sb = sb + "  \"tick_p999_us\": " + lagS.P999.ToString() + "," + nl;
+        sb = sb + "  \"tick_max_us\": " + lagS.Max.ToString() + "," + nl;
+        sb = sb + "  \"compute_p50_us\": " + compS.P50.ToString() + "," + nl;
+        sb = sb + "  \"compute_p99_us\": " + compS.P99.ToString() + "," + nl;
+        sb = sb + "  \"compute_p999_us\": " + compS.P999.ToString() + "," + nl;
+        sb = sb + "  \"compute_max_us\": " + compS.Max.ToString() + "," + nl;
+        sb = sb + "  \"missed_50ms\": " + lagS.Missed50.ToString() + "," + nl;
+        sb = sb + "  \"missed_100ms\": " + lagS.Missed100.ToString() + "," + nl;
+        sb = sb + "  \"missed_200ms\": " + lagS.Missed200.ToString() + "," + nl;
+        sb = sb + "  \"rss_peak_bytes\": " + rss.ToString() + "," + nl;
+        sb = sb + "  \"cpu_seconds\": " + CpuSeconds(cpuUs) + "," + nl;
+        // z42 0.7.0 does not expose allocated bytes; object count comes from the GC counters.
+        sb = sb + "  \"alloc_bytes\": 0," + nl;
+        sb = sb + "  \"alloc_objects\": " + (c1.Allocations - c0.Allocations).ToString() + "," + nl;
+        sb = sb + "  \"os\": \"linux\"," + nl;
+        sb = sb + "  \"arch\": \"x64\"," + nl;
+        sb = sb + "  \"rooms_parallel\": true," + nl;
+        sb = sb + "  \"metric\": \"deadline_lag\"," + nl;
+        sb = sb + "  \"tick_interval_us\": " + Kernel.TickBudgetUs.ToString() + "," + nl;
+        sb = sb + "  \"runtime\": {\"scheduler\": \"os-thread-per-room\", \"spin_last_us\": " + (cfg.SpinNs / 1000L).ToString()
+            + ", \"minor_collections\": " + (c1.MinorCollections - c0.MinorCollections).ToString()
+            + ", \"major_collections\": " + (c1.MajorCollections - c0.MajorCollections).ToString()
+            + ", \"jit_methods\": " + (c1.JitMethodsCompiled - c0.JitMethodsCompiled).ToString()
+            + ", \"jit_native_from_interp\": " + (c1.JitNativeFromInterp - c0.JitNativeFromInterp).ToString() + "}" + nl;
+        sb = sb + "}";
+        return sb;
+    }
+}
