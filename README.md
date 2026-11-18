@@ -1,6 +1,6 @@
 # battle-runtime-benchmark
 
-同一套确定性战斗核，对比 Go / Rust / Zig / Elixir / Java 在 **20Hz 战斗服** 上的到期滞后（deadline lag）。
+同一套确定性战斗核，对比 Go / Rust / Zig / Elixir / Java 在 **20Hz 战斗服** 上的到期滞后（deadline lag）。另有 z42 0.7.0 的附加实现，单独构建、单独跑，见 [`z42/`](z42/README.md)。
 
 这不是「四种 GC 对比」。Go 有 tracing GC，Elixir 是按进程的 copying GC，Rust 和 Zig 默认是显式生命周期 / allocator。产品问题只有一句：
 
@@ -79,6 +79,24 @@ ONLY=java ./scripts/run_long.sh     # → results/long_java.jsonl
 Go/Rust/Zig 的计算 p99 分不开（都是 15µs），差在 runtime 和调度。Java 计算 p99 是 62µs，仍和它们同一量级，不是 Elixir 那种 10ms 内核。Java 日常 p99 11.1ms 靠近 Rust；max 67ms 越了 50ms，但 30 分钟里没有超过 100ms 的帧。RSS 约 1.9GB，靠近 Elixir。
 
 短对比在 Mini 上。Go 复用、1000 房高压在 2 分钟里就已经出现 max 106ms / 2000 次超预算；Java / Elixir 12 格 hash 全部与同格 Go/Rust 对齐。短跑数字见下方 jsonl，不要和长跑混在一张表里读。
+
+## z42（附加实现，单独跑）
+
+[`z42/`](z42/README.md) 是同一套内核的 [z42](https://github.com/z42-lang/z42) 版（0.7.0）。**它不接入 `scripts/compare.sh` / `run_matrix.sh` / `run_long.sh`**，构建、运行、矩阵都在 `z42/` 内闭环（`./run.sh`、`./bench_matrix.sh`）。
+
+`world_hash` / `damage_total` / `alive_players` 与 Go 参考实现逐字节一致（1/2/3/5/100 房、arena/naive、low→insane 共 8 组）。下面是豆包云主机（Linux x64，4 vCPU，glibc 2.35 + 自带 2.39 loader）600 tick、40 人/房、seed 1234 的一组对照，Go 同机同参数：
+
+| 语言 | alloc | 房间 | 线程 | lag p50 | lag p99 | lag max | 超 50ms | 计算 p50 | 计算 p99 | RSS | CPU |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| z42 | arena | 1 | 1 | 0.15ms | 0.22ms | 0.36ms | 0 | 139µs | 200µs | 25MB | 1.2s |
+| z42 | arena | 100 | 4 | 1.33ms | 3.06ms | 4.64ms | 0 | 94µs | 161µs | 32MB | 9.5s |
+| z42 | naive | 100 | 4 | 1.51ms | 4.17ms | 14.8ms | 0 | 107µs | 182µs | 47MB | 9.8s |
+| Go | arena | 100 | - | 0.76ms | 1.39ms | 1.85ms | 0 | 5µs | 15µs | 5MB | 0.54s |
+| Go | naive | 100 | - | 1.02ms | 2.10ms | 2.96ms | 0 | 9µs | 492µs | 8MB | 0.82s |
+
+1000 房（600 tick、medium、arena）：一房一线程时 1000 个 OS 线程挤 4 核，lag p99 302ms、max 930ms、超预算 16549 次；默认 worker 池只起 4 个线程，同样 `world_hash=b61def3711760a01`，lag p99 25ms、max 38ms、0 次超预算。
+
+读法：z42 0.7.0 的 JIT 计算是 Go 的 12–20 倍（~100µs vs ~5µs），但 100 房仍在 50ms 预算内；naive 的 max 来自 minor GC，arena 的 free-list 复用把它压到 5ms 以内。这台是 4 vCPU 云主机，**不能和上面 Mac Mini / 12 核的数字横比**，只用于验证 z42 实现本身。完整 8 格矩阵在 `z42/` 的 `bench_matrix.sh`，口径和限制见 [`z42/NOTES.md`](z42/NOTES.md)。
 
 ## 结论
 
