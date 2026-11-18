@@ -15,6 +15,8 @@ public class Config {
     public bool Arena = false;
     public long CastMod = 10;
     public long SpinNs = 1000000;
+    // -1: auto (min(CPU count, rooms)); 0: one OS thread per room; N > 0: fixed worker pool.
+    public int Workers = -1;
 }
 
 public class RoomOut {
@@ -53,7 +55,7 @@ public static class Program {
         for (int i = 0; i < args.Length; i++) {
             string k = args[i];
             if (k == "--help" || k == "-h") {
-                Console.WriteLine("z42-battle --rooms N --players N --ticks N --seed N --workload low|medium|high|insane --alloc naive|arena [--spin-us N]");
+                Console.WriteLine("z42-battle --rooms N --players N --ticks N --seed N --workload low|medium|high|insane --alloc naive|arena [--spin-us N] [--workers N]");
                 Environment.Exit(0);
             }
             if (i + 1 >= args.Length) {
@@ -74,6 +76,8 @@ public static class Program {
                 cfg.Alloc = v;
             } else if (k == "--spin-us") {
                 cfg.SpinNs = Int64.Parse(v) * 1000;
+            } else if (k == "--workers") {
+                cfg.Workers = (int)Int64.Parse(v);
             } else {
                 return Fail("unknown flag " + k);
             }
@@ -95,6 +99,9 @@ public static class Program {
         }
         if (cfg.SpinNs < 0) {
             cfg.SpinNs = 0;
+        }
+        if (cfg.Workers < -1) {
+            return Fail("workers must be -1 (auto), 0 (thread per room) or > 0");
         }
         return cfg;
     }
@@ -118,34 +125,45 @@ public static class Program {
         }
     }
 
-    private static RoomOut SimulateRoom(Config cfg, long roomID, long startNs) {
-        Room rm = new Room(cfg.Seed, roomID, cfg.Players, cfg.Arena, cfg.CastMod);
+    /// One worker loops over the shared 50ms grid and ticks every room assigned to it
+    /// (round-robin by index). A worker owns 1 room when workers == rooms (the old
+    /// thread-per-room model) and hundreds when the pool is smaller than the room count.
+    private static void RunWorker(Config cfg, Room[] rooms, RoomOut[] outs, long startNs, int workerIdx, int workers) {
         bool skipWarmup = cfg.Ticks > Kernel.WarmupTicks;
         long interval = Kernel.TickBudgetUs * 1000L;
-        RoomOut res = new RoomOut();
-        res.Hash = 0;
-        res.Damage = 0;
-        res.Alive = 0;
-        res.Lags = new List<long>(cfg.Ticks);
-        res.Computes = new List<long>(cfg.Ticks);
         for (int t = 0; t < cfg.Ticks; t++) {
             long due = startNs + (long)t * interval;
             WaitUntil(due, cfg.SpinNs);
-            long t0 = Clock.MonoNanos();
-            rm.Tick(cfg.CastMod);
-            long done = Clock.MonoNanos();
-            long lag = (done - due) / 1000L;
-            if (lag < 0) { lag = 0; }
-            long compute = (done - t0) / 1000L;
-            if (!skipWarmup || t >= Kernel.WarmupTicks) {
-                res.Lags.Add(lag);
-                res.Computes.Add(compute);
+            for (int k = workerIdx; k < rooms.Length; k = k + workers) {
+                Room rm = rooms[k];
+                RoomOut res = outs[k];
+                long t0 = Clock.MonoNanos();
+                rm.Tick(cfg.CastMod);
+                long done = Clock.MonoNanos();
+                long lag = (done - due) / 1000L;
+                if (lag < 0) { lag = 0; }
+                long compute = (done - t0) / 1000L;
+                if (!skipWarmup || t >= Kernel.WarmupTicks) {
+                    res.Lags.Add(lag);
+                    res.Computes.Add(compute);
+                }
             }
         }
-        res.Hash = rm.Hash;
-        res.Damage = rm.DamageTotal;
-        res.Alive = rm.AliveCount();
-        return res;
+    }
+
+    /// -1 -> min(CPU count, rooms); 0 -> one thread per room; N -> N workers.
+    private static int ResolveWorkers(Config cfg) {
+        int cpu = OperatingSystem.CpuCount();
+        if (cpu < 1) { cpu = 1; }
+        int w = cfg.Workers;
+        if (w < 0) {
+            w = cpu;
+            if (w > cfg.Rooms) { w = cfg.Rooms; }
+        }
+        if (w == 0) { w = cfg.Rooms; }
+        if (w > cfg.Rooms) { w = cfg.Rooms; }
+        if (w < 1) { w = 1; }
+        return w;
     }
 
     private static long Percentile(List<long> sorted, long permille) {
@@ -230,17 +248,29 @@ public static class Program {
         RuntimeCounters c0 = RuntimeStats.Counters();
         long startNs = Clock.MonoNanos();
 
+        int workers = ResolveWorkers(cfg);
+        Room[] rooms = new Room[cfg.Rooms];
         RoomOut[] outs = new RoomOut[cfg.Rooms];
-        Thread[] threads = new Thread[cfg.Rooms];
         for (int i = 0; i < cfg.Rooms; i++) {
-            int idx = i;
-            long roomID = (long)(i + 1);
-            threads[i] = Thread.Start(() => {
-                outs[idx] = SimulateRoom(cfg, roomID, startNs);
+            rooms[i] = new Room(cfg.Seed, (long)(i + 1), cfg.Players, cfg.Arena, cfg.CastMod);
+            RoomOut ro = new RoomOut();
+            ro.Hash = 0;
+            ro.Damage = 0;
+            ro.Alive = 0;
+            ro.Lags = new List<long>(cfg.Ticks);
+            ro.Computes = new List<long>(cfg.Ticks);
+            outs[i] = ro;
+        }
+
+        Thread[] threads = new Thread[workers];
+        for (int w = 0; w < workers; w++) {
+            int workerIdx = w;
+            threads[w] = Thread.Start(() => {
+                RunWorker(cfg, rooms, outs, startNs, workerIdx, workers);
             });
         }
-        for (int i = 0; i < cfg.Rooms; i++) {
-            threads[i].Join();
+        for (int w = 0; w < workers; w++) {
+            threads[w].Join();
         }
 
         List<long> lags = new List<long>(cfg.Rooms * cfg.Ticks);
@@ -250,6 +280,10 @@ public static class Program {
         long alive = 0;
         for (int i = 0; i < cfg.Rooms; i++) {
             RoomOut o = outs[i];
+            Room rm = rooms[i];
+            o.Hash = rm.Hash;
+            o.Damage = rm.DamageTotal;
+            o.Alive = rm.AliveCount();
             worldHash = Kernel.Mix(worldHash, o.Hash);
             damage = damage + o.Damage;
             alive = alive + o.Alive;
@@ -296,7 +330,10 @@ public static class Program {
         sb = sb + "  \"rooms_parallel\": true," + nl;
         sb = sb + "  \"metric\": \"deadline_lag\"," + nl;
         sb = sb + "  \"tick_interval_us\": " + Kernel.TickBudgetUs.ToString() + "," + nl;
-        sb = sb + "  \"runtime\": {\"scheduler\": \"os-thread-per-room\", \"spin_last_us\": " + (cfg.SpinNs / 1000L).ToString()
+        string scheduler = "worker-pool";
+        if (workers >= cfg.Rooms) { scheduler = "os-thread-per-room"; }
+        sb = sb + "  \"runtime\": {\"scheduler\": \"" + scheduler + "\", \"workers\": " + workers.ToString()
+            + ", \"spin_last_us\": " + (cfg.SpinNs / 1000L).ToString()
             + ", \"minor_collections\": " + (c1.MinorCollections - c0.MinorCollections).ToString()
             + ", \"major_collections\": " + (c1.MajorCollections - c0.MajorCollections).ToString()
             + ", \"jit_methods\": " + (c1.JitMethodsCompiled - c0.JitMethodsCompiled).ToString()

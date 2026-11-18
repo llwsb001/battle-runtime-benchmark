@@ -41,7 +41,9 @@ done
 - `out` 是关键字，不能当变量名。
 - `Thread.Sleep` **只有毫秒精度**（本机实测 1ms→1.056ms、5ms→5.06ms、49ms→49.09ms），所以 `WaitUntil` 用「睡到 due 前 N µs + 忙等」，默认 `--spin-us 1000`；`--spin-us 0` 会退化成纯 Sleep，基线 lag 抬到毫秒级。
 - 没有分配字节计数（`GC.GetTotalAllocatedBytes` 之类），`alloc_bytes` 只能写 0；`RuntimeStats.Counters()` 能给 `Allocations` / `MinorCollections` / `MajorCollections` / `JitMethodsCompiled` / `JitNativeFromInterp`。
-- 线程 = OS 线程（`Thread.Start`），1000 房就是 1000 个线程 + 1ms 级 timer，扩展性和 Go 的 goroutine 不可直接类比。
+- **没有 async / spawn / 绿色线程**：0.7.0 只有 `Std.Threading.Thread`（OS 线程）、`Mutex<T>`、`Channel<T>`、`Timer`；`docs/internals/runtime/concurrency.md` 里的 async/await 是 L3 设计稿，尚未实现。所以线程数就是 OS 线程数。
+- 因此本实现自带 **worker 池**：默认 `min(CPU 数, 房间数)` 个线程，房间按下标 round-robin 分配到 worker；每个 worker 在 50ms 到期点醒来后依次 tick 自己名下的房间。`--workers 0` 回到一房一线程做对照，`--workers N` 指定固定线程数。1000 房默认只起 4 个线程，而不是 1000 个。
+- 代价：同一 worker 上的多个房间共享同一个到期点，排在后面的房间 lag 必然更大（排队成本）；这不是 goroutine 的抢占式调度，但 lag/compute 的口径和 Go 版一致，可横向读。
 
 ## 语义对齐踩过的坑
 
