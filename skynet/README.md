@@ -83,7 +83,7 @@ seed 1234，与同机 Go 完全一致（`world_hash` / `damage_total` / `alive_p
 | naive | 50 | 4.28ms | 7.46ms | 19.1ms | 0 | 116µs | 292µs | 26MB | 4.34s |
 | arena | 100 | 5.46ms | 8.85ms | 13.0ms | 0 | 98µs | 159µs | 28MB | 6.84s |
 | naive | 100 | 5.99ms | 9.56ms | 11.8ms | 0 | 115µs | 194µs | 36MB | 8.10s |
-| Go arena | 100 | 0.71ms | 1.82ms | 6.2ms | 0 | 4µs | — | 5MB | 0.49s |
+| Go arena | 100 | 0.71ms | 1.82ms | 6.2ms | 0 | 4µs | — | 4.3MB | 0.49s |
 
 1000 房、600 tick、medium、arena（同一个 `world_hash=b61def3711760a01`）：
 
@@ -92,7 +92,7 @@ seed 1234，与同机 Go 完全一致（`world_hash` / `damage_total` / `alive_p
 | 4 worker（默认） | 15.7ms | **82.4ms** | 127.7ms | **146.5ms** | **12263** | 253µs | 146MB | 68.4s |
 | 8 worker | 15.4ms | 32.4ms | 64.4ms | 90.9ms | 1177 | 207µs | 156MB | 66.7s |
 | Elixir（4 scheduler） | 224.7ms | **984.8ms** | 1234.9ms | **1559.3ms** | **564776**（94%） | 42.5ms | 531MB | 119.5s |
-| Go 对照 | 1.52ms | 2.64ms | — | 3.58ms | 0 | — | 5MB | 3.69s |
+| Go 对照 | 1.51ms | 2.65ms | — | 3.19ms | 0 | — | 31.9MB | 3.83s |
 
 1000 房 8 worker 仍有 0.2% 的帧超预算，p999 64ms：不是内核算不动（compute p99 207µs），是 1000 个 coroutine 在同一 10ms 边界醒来后的排队和偶发 GC。
 
@@ -115,6 +115,7 @@ seed 1234，与同机 Go 完全一致（`world_hash` / `damage_total` / `alive_p
 - **1–100 房 Elixir 的 lag 更低，但 compute 更贵。** Elixir 用 `Process.sleep(ms)`，1ms 粒度；skynet 的 `sleep` 是 10ms 粒度，所以 lag 里有 1–10ms 的定时器噪声。内核本身 Elixir 是 2.5–5.1ms/帧，skynet 是 0.16ms/帧。
 - **1000 房是分界**：Elixir 每个 `Task` 都要在 4 个 scheduler 上抢执行权，`compute` 的墙钟被调度/进程 GC 拉到 42.5ms，94% 的 tick 超 50ms，max 1.56s；skynet 的 compute 仍是 96µs，输在 coroutine 排队（4 worker p99 82ms，8 worker 32ms）。
 - Elixir 的 `compute_*` 在过载时是**墙钟**（包含被抢占的时间），不是纯 CPU；它的 `cpu_seconds` 119.5s 才是真实 CPU，约为 skynet 的 1.8 倍、Go 的 32 倍。
+- Go 的 31.9MB 里约 9.6MB 是 600k×2 个 int64 的样本数组（lag/compute 每房每 tick 各一条），不是内核数据；100 房时是 4.3MB。早先表里 1000 房的 5MB 是误把 100 房的数抄过去，已用同机重跑更正。
 - 两边都没有在 4 vCPU 上守住 1000 房/40 人；能守住的是 Go。这条对比的价值是：**同样是「一房一个执行单元」的 actor/process 模型，Lua coroutine 的内核 compute p99 比 BEAM process 低约 32 倍（100 房），1000 房时 p99 差 12 倍。**
 
 ## 实现说明
