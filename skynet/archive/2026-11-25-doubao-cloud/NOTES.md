@@ -17,6 +17,8 @@
 | `rooms_1000_threads8.json` | 同上，8 worker |
 | `matrix_elixir.jsonl` | 同机 Elixir 8 格（1/10/50/100 × arena/naive），600 tick，medium |
 | `rooms_1000_elixir.json` | 同机 Elixir 1000 房，600 tick，medium，arena |
+| `matrix_elixir_live.jsonl` | Elixir 1/10/50/100 房的内存探针（GC 后进程堆） |
+| `rooms_1000_elixir_live.json` | Elixir 1000 房内存探针 |
 
 ## 摘要
 
@@ -35,6 +37,16 @@
 | 50 | 2.50ms | 3.72ms | 5.5ms | 0 | 984µs | 2.35ms | 6.74s | 85MB |
 | 100 | 4.47ms | 6.73ms | 16.5ms | 0 | 2.56ms | 5.15ms | 13.0s | 117MB |
 | 1000 | 224.7ms | 984.8ms | 1559.3ms | 564776 | 42.5ms | 52.5ms | 119.5s | 531MB |
+
+内存探针（每房跑完后 fullsweep GC 再读进程堆，**该轮 tick 计时不可用**）：
+
+| rooms | live_room_bytes | RSS（正常跑） |
+|---|---|---|
+| 1 | 0.06MB | 64MB |
+| 10 | 0.62MB | 71MB |
+| 50 | 3.09MB | 85MB |
+| 100 | 6.52MB | 117MB |
+| 1000 | 66.4MB | 531MB |
 
 ## Go 对照（同机，本目录未入库）
 

@@ -116,6 +116,23 @@ seed 1234，与同机 Go 完全一致（`world_hash` / `damage_total` / `alive_p
 - **1000 房是分界**：Elixir 每个 `Task` 都要在 4 个 scheduler 上抢执行权，`compute` 的墙钟被调度/进程 GC 拉到 42.5ms，94% 的 tick 超 50ms，max 1.56s；skynet 的 compute 仍是 96µs，输在 coroutine 排队（4 worker p99 82ms，8 worker 32ms）。
 - Elixir 的 `compute_*` 在过载时是**墙钟**（包含被抢占的时间），不是纯 CPU；它的 `cpu_seconds` 119.5s 才是真实 CPU，约为 skynet 的 1.8 倍、Go 的 32 倍。
 - Go 的 31.9MB 里约 9.6MB 是 600k×2 个 int64 的样本数组（lag/compute 每房每 tick 各一条），不是内核数据；100 房时是 4.3MB。早先表里 1000 房的 5MB 是误把 100 房的数抄过去，已用同机重跑更正。
+### Elixir 内存：live 与 RSS
+
+`--live-probe` 会在每房 tick 跑完后对该房进程做一次 fullsweep GC，再读 `Process.info(self(), :memory)` 并求和。探针的 GC 会和 tick 抢 scheduler，所以这一轮只看内存，不看 lag。
+
+| rooms | live_room_bytes | RSS（正常跑） | RSS/live |
+|---|---|---|---|
+| 1 | 0.06MB | 64MB | ~1000× |
+| 10 | 0.62MB | 71MB | 114× |
+| 50 | 3.09MB | 85MB | 27× |
+| 100 | 6.52MB | 117MB | 18× |
+| 1000 | 66.4MB | 531MB | 8× |
+
+- `live_room_bytes` 是 GC 后所有房进程 heap+stack 之和，不含共享代码、binary、ETS、样本数组和分配器空闲页；正常跑与探针跑的 RSS 都在 520–540MB。
+- 1000 房时房间状态只有 66MB（约 66KB/房）。531MB 里约 465MB 不在房进程里：600k×2 个样本的 list cell（约 19MB）、BEAM code/binary，以及 4 个 scheduler 的 allocator 保留页。
+- 所以 531MB 要分两层看：live 66MB 和 skynet 扣掉 14MB 基线后的 132MB 是同一量级（skynet 那份含 1000 个 Lua VM 的固定开销）；RSS 差距主要是运行时保留，不是数据膨胀。
+- 这也解释了 `memory_total` 143MB 为什么仍大于 live 66MB：ERTS 把分配器里的 free block 也算进 total。
+
 - 两边都没有在 4 vCPU 上守住 1000 房/40 人；能守住的是 Go。这条对比的价值是：**同样是「一房一个执行单元」的 actor/process 模型，Lua coroutine 的内核 compute p99 比 BEAM process 低约 32 倍（100 房），1000 房时 p99 差 12 倍。**
 
 ## 实现说明

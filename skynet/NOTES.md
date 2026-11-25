@@ -80,6 +80,8 @@ Elixir 侧结果（600 tick，medium，arena，4 scheduler，`player_store=tuple
 
 1000 房 94% 的 tick 超 50ms。过载时 Elixir 的 `compute_*` 是被抢占的墙钟，不等于纯 CPU；看 `cpu_seconds`。
 
+内存补充：`--live-probe` 在每个房进程跑完后做 fullsweep GC，读 `Process.info(self(), :memory)` 求和，得到 live_room_bytes（不含共享 code/binary/ETS/样本数组）。1000 房 66.4MB，RSS 531MB；1/10/50/100 房分别是 0.06/0.62/3.09/6.52MB。探针会和 tick 抢 scheduler，带探针的 run 不要用于 lag/compute 对比。
+
 ## 结果摘要
 
 8 格矩阵（600 tick，medium，4 worker）全部与 Go hash 对齐，数字见 `README.md` / `archive/2026-11-25-doubao-cloud/`。
