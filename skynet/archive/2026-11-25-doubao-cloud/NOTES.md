@@ -15,6 +15,8 @@
 | `matrix_skynet.jsonl` | 8 格：1/10/50/100 房 × arena/naive，600 tick，medium，4 worker |
 | `rooms_1000_threads4.json` | 1000 房，600 tick，medium，arena，4 worker |
 | `rooms_1000_threads8.json` | 同上，8 worker |
+| `matrix_elixir.jsonl` | 同机 Elixir 8 格（1/10/50/100 × arena/naive），600 tick，medium |
+| `rooms_1000_elixir.json` | 同机 Elixir 1000 房，600 tick，medium，arena |
 
 ## 摘要
 
@@ -23,6 +25,16 @@
 - 1000 房 4 worker：lag p99 82.4ms、超 50ms 12263 次（600k tick 的 2%）、compute p99 253µs、RSS 146MB、CPU 68.4s。
 - 1000 房 8 worker：lag p99 32.4ms、超 50ms 1177 次（0.2%）、无 >100ms、CPU 66.7s。
 - Go 1000 房：lag p99 2.64ms、0 次超预算、CPU 3.69s。
+
+## Elixir 对照（同机，OTP 27 + Elixir 1.18.4，4 scheduler）
+
+| rooms | lag p50 | lag p99 | lag max | 超 50ms | compute p50 | compute p99 | CPU | RSS |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1.56ms | 1.90ms | 2.6ms | 0 | 245µs | 500µs | 0.18s | 64MB |
+| 10 | 1.45ms | 1.69ms | 2.6ms | 0 | 405µs | 630µs | 1.65s | 71MB |
+| 50 | 2.50ms | 3.72ms | 5.5ms | 0 | 984µs | 2.35ms | 6.74s | 85MB |
+| 100 | 4.47ms | 6.73ms | 16.5ms | 0 | 2.56ms | 5.15ms | 13.0s | 117MB |
+| 1000 | 224.7ms | 984.8ms | 1559.3ms | 564776 | 42.5ms | 52.5ms | 119.5s | 531MB |
 
 ## Go 对照（同机，本目录未入库）
 

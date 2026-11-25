@@ -12,6 +12,7 @@
 - 1–100 房都在 50ms 预算内：100 房 p99 8.9ms、0 次超预算。
 - 1000 房默认 4 线程压不住：p99 82ms、600k 个 tick 里 12263 次超 50ms（2%）。`SKYNET_THREAD=8` 后 p99 32ms、超预算 1177 次（0.2%）、没有 >100ms 的帧。
 - 1000 房的失败点和 z42 的 1000 线程不一样：这里不是线程爆炸，是 4 个 worker 上 1000 个 coroutine 的排队 + 10ms 定时器粒度 + Lua GC。
+- 同机 Elixir 对照（同 4 scheduler、Task/房）：100 房 compute p99 5.1ms（skynet 159µs）；1000 房 p99 984.8ms、94% 的 tick 超预算。BEAM 在这个负载下先被调度/进程 GC 拖垮，见下文。
 
 ## 线程模型
 
@@ -90,11 +91,31 @@ seed 1234，与同机 Go 完全一致（`world_hash` / `damage_total` / `alive_p
 |---|---|---|---|---|---|---|---|---|
 | 4 worker（默认） | 15.7ms | **82.4ms** | 127.7ms | **146.5ms** | **12263** | 253µs | 146MB | 68.4s |
 | 8 worker | 15.4ms | 32.4ms | 64.4ms | 90.9ms | 1177 | 207µs | 156MB | 66.7s |
+| Elixir（4 scheduler） | 224.7ms | **984.8ms** | 1234.9ms | **1559.3ms** | **564776**（94%） | 42.5ms | 531MB | 119.5s |
 | Go 对照 | 1.52ms | 2.64ms | — | 3.58ms | 0 | — | 5MB | 3.69s |
 
 1000 房 8 worker 仍有 0.2% 的帧超预算，p999 64ms：不是内核算不动（compute p99 207µs），是 1000 个 coroutine 在同一 10ms 边界醒来后的排队和偶发 GC。
 
 **这台是 4 vCPU 云主机，和仓库里 Mac Mini M4 / 12 核的历史数据不能横比。**
+
+## 同机 Elixir 对照（同一台 4 vCPU）
+
+同仓库 `../elixir`，OTP 27 + Elixir 1.18.4，默认 4 个 scheduler，1 个 `Task` / 房间，`player_store=tuple`，600 tick、medium、arena：
+
+| 房间 | Elixir lag p50 | Elixir lag p99 | Elixir compute p50 | Elixir compute p99 | Skynet lag p99 | Skynet compute p99 |
+|---|---|---|---|---|---|---|---|
+| 1 | 1.56ms | 1.90ms | 245µs | 500µs | 2.70ms | 175µs |
+| 10 | 1.45ms | 1.69ms | 405µs | 630µs | 4.73ms | 335µs |
+| 50 | 2.50ms | 3.72ms | 984µs | 2.35ms | 6.30ms | 149µs |
+| 100 | 4.47ms | 6.73ms | 2.56ms | 5.15ms | 8.85ms | 159µs |
+| 1000 | 224.7ms | 984.8ms | 42.5ms | 52.5ms | 82.4ms（4 worker）/ 32.4ms（8 worker） | 253µs |
+
+读法：
+
+- **1–100 房 Elixir 的 lag 更低，但 compute 更贵。** Elixir 用 `Process.sleep(ms)`，1ms 粒度；skynet 的 `sleep` 是 10ms 粒度，所以 lag 里有 1–10ms 的定时器噪声。内核本身 Elixir 是 2.5–5.1ms/帧，skynet 是 0.16ms/帧。
+- **1000 房是分界**：Elixir 每个 `Task` 都要在 4 个 scheduler 上抢执行权，`compute` 的墙钟被调度/进程 GC 拉到 42.5ms，94% 的 tick 超 50ms，max 1.56s；skynet 的 compute 仍是 96µs，输在 coroutine 排队（4 worker p99 82ms，8 worker 32ms）。
+- Elixir 的 `compute_*` 在过载时是**墙钟**（包含被抢占的时间），不是纯 CPU；它的 `cpu_seconds` 119.5s 才是真实 CPU，约为 skynet 的 1.8 倍、Go 的 32 倍。
+- 两边都没有在 4 vCPU 上守住 1000 房/40 人；能守住的是 Go。这条对比的价值是：**同样是「一房一个执行单元」的 actor/process 模型，Lua coroutine 的内核 compute p99 比 BEAM process 低约 32 倍（100 房），1000 房时 p99 差 12 倍。**
 
 ## 实现说明
 

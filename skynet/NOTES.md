@@ -57,6 +57,29 @@ return ((hi % d) * (4294967296 % d) + lo) % d
 - `naive`：每次 spawn 新建 Lua table，event 每帧新建表，snapshot 每帧新建 4 个数组。
 - 这和 Go 的 struct slice 不是同构分配：Lua table 有 hash 部分和 GC 头，naive 的绝对成本被放大。表里只能读「复用 vs 不复用」的相对差，不能当分配器横比。
 
+## 同机 Elixir 工具链
+
+仓库 `../elixir` 需要 OTP 27（代码用了 OTP 27 的 `:json` 模块）和 Elixir ~> 1.17，云主机没有现成包，做法：
+
+1. 从清华镜像装 `libssl-dev` / `libncurses-dev` / `m4` / `unzip`（archive.ubuntu.com 不通）。
+2. 源码编译 OTP `OTP-27.3.4.20` 到 `/home/user/otp27`：
+   `./configure --prefix=/home/user/otp27 --without-javac --without-wx --without-odbc --without-docs && make -j4 && make install`
+3. 本轮踩的坑：`debugger` / `observer` / `et` 的 `wx` 模块在 `--without-wx` 下会报 `behaviour wx_object undefined`。解法是在 `lib/SKIP-APPLICATIONS` 写 `debugger observer wx jinterface odbc et`，让顶层 build 跳过这些 app。
+4. Elixir 用官方预编译包 `elixir-otp-27.zip`（v1.18.4），解压到 `/home/user/elixir`，`PATH` 同时加 `otp27/bin` 和 `elixir/bin`。
+5. `cd elixir && mix escript.build`，产物 `battle_bench`。
+
+Elixir 侧结果（600 tick，medium，arena，4 scheduler，`player_store=tuple`）：
+
+| rooms | lag p50 | lag p99 | compute p50 | compute p99 | CPU | RSS |
+|---|---|---|---|---|---|---|
+| 1 | 1.56ms | 1.90ms | 245µs | 500µs | 0.18s | 64MB |
+| 10 | 1.45ms | 1.69ms | 405µs | 630µs | 1.65s | 71MB |
+| 50 | 2.50ms | 3.72ms | 984µs | 2.35ms | 6.74s | 85MB |
+| 100 | 4.47ms | 6.73ms | 2.56ms | 5.15ms | 13.0s | 117MB |
+| 1000 | 224.7ms | 984.8ms | 42.5ms | 52.5ms | 119.5s | 531MB |
+
+1000 房 94% 的 tick 超 50ms。过载时 Elixir 的 `compute_*` 是被抢占的墙钟，不等于纯 CPU；看 `cpu_seconds`。
+
 ## 结果摘要
 
 8 格矩阵（600 tick，medium，4 worker）全部与 Go hash 对齐，数字见 `README.md` / `archive/2026-11-25-doubao-cloud/`。
