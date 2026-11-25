@@ -122,4 +122,4 @@ JSON 里 `metric` 为 `deadline_lag`，`tick_interval_us` 为 `50000`。读延�
 - 600 tick、40 人、medium：1–100 房 0 次超 50ms，100 房 arena lag p99 8.9ms；计算 p50 96–110µs（Go 4–6µs）。
 - 1000 房：4 worker p99 82.4ms、12263 次超预算；8 worker p99 32.4ms、1177 次（0.2%），没有 >100ms。
 - 9 组 `world_hash` 与 Go 全部一致；细节和 Lua 64 位取模的坑见 [`skynet/README.md`](skynet/README.md) 和 [`skynet/NOTES.md`](skynet/NOTES.md)。
-- 同一台机器上补跑了仓库里的 Elixir（OTP 27 + Elixir 1.18.4，4 scheduler，Task/房）：100 房 lag p99 6.7ms / compute p99 5.15ms；1000 房 lag p99 984.8ms、94% 的 tick 超预算。同样是「一房一个执行单元」，Lua coroutine 的内核 compute p99 比 BEAM process 低约 32 倍（100 房），1000 房时 p99 差 12 倍。
+- 同一台机器上补跑了仓库里的 Elixir（OTP 27 + Elixir 1.18.4，4 scheduler，Task/房）：100 房 lag p99 6.7ms / compute p99 5.15ms；1000 房 lag p99 984.8ms、94% 的 tick 超预算。同样是「一房一个执行单元」，Lua coroutine 的内核 compute p99 比 BEAM process 低约 32 倍（100 房），1000 房时 p99 差 12 倍。内存上 Elixir 的 live 房间状态只有 66MB（1000 房，GC 后进程堆求和），531MB RSS 里约 87% 是分配器保留、样本数组和共享代码。
