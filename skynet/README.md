@@ -1,0 +1,114 @@
+# skynet（Lua）战斗内核基准
+
+用 [cloudwu/skynet](https://github.com/cloudwu/skynet) 跑同一套确定性战斗核：**一个房间一个 skynet service**，service 是 Lua coroutine，跑在固定数量的 OS worker 线程上。1000 房也不会变成 1000 个线程。
+
+规则与 [`../go/sim.go`](../go/sim.go) 顶部一致，`world_hash` / `damage_total` / `alive_players` 与同机 Go 逐字节对齐。
+
+**独立目录，不接入 `../scripts/`。** 构建、运行、矩阵都在本目录闭环。
+
+## 结论
+
+- 计算 p50 **96–110µs**（Go 同机 4–6µs，约 18 倍）；Lua 解释执行是主要成本，不是分配。
+- 1–100 房都在 50ms 预算内：100 房 p99 8.9ms、0 次超预算。
+- 1000 房默认 4 线程压不住：p99 82ms、600k 个 tick 里 12263 次超 50ms（2%）。`SKYNET_THREAD=8` 后 p99 32ms、超预算 1177 次（0.2%）、没有 >100ms 的帧。
+- 1000 房的失败点和 z42 的 1000 线程不一样：这里不是线程爆炸，是 4 个 worker 上 1000 个 coroutine 的排队 + 10ms 定时器粒度 + Lua GC。
+
+## 线程模型
+
+| 项目 | 设置 |
+|---|---|
+| 执行单元 | 1 个 skynet service（Lua coroutine）/ 房间 |
+| worker 线程 | `thread` 配置，默认 4（本机 vCPU 数）；`SKYNET_THREAD` 可改 |
+| 计时 | `skynet.hpc()`（CLOCK_MONOTONIC，ns）测完成时刻与 compute |
+| 节拍 | `skynet.sleep(ceil(剩余/10ms))`，skynet 定时器单位是 1/100s |
+
+所有房间共享同一个绝对 `start`，第 t 帧到期 = `start + t × 50ms`；早到就睡，晚到就直接算。前 20 个 tick 不进统计，和 Go 一致。
+
+**注意 skynet 定时器是 10ms 一格**：`sleep` 只能按 centisecond 睡，所以 lag 里天然含 0–10ms 的定时器粒度（1 房 p50 1.4ms、100 房 p50 5.5ms 主要来自这里）。纯内核成本看 `compute_*`，它用 ns 计数器单独夹出来。
+
+## 安装 skynet
+
+```bash
+git clone --depth 1 https://github.com/cloudwu/skynet.git "$HOME/skynet"
+cd "$HOME/skynet" && make -j4 linux
+```
+
+依赖 gcc / make。skynet 自带 Lua 5.5（64 位整数、逻辑右移），**不要换 LuaJIT**：LuaJIT 的数字是 double，64 位 hash 语义直接崩。
+
+`run.sh` 默认 `SKYNET_ROOT=$HOME/skynet`，可用环境变量覆盖。
+
+## 跑
+
+```bash
+cd skynet
+./run.sh "rooms=100;players=40;ticks=600;seed=1234;workload=medium;alloc=arena"
+
+# 1000 房，8 个 worker
+SKYNET_THREAD=8 ./run.sh "rooms=1000;players=40;ticks=600;seed=1234;workload=medium;alloc=arena"
+
+# 8 格矩阵 → results/matrix_skynet.jsonl
+ROOMS="1 10 50 100" ALLOCS="arena naive" WORKLOAD=medium TICKS=600 ./bench_matrix.sh
+```
+
+`run.sh` 会生成临时 skynet 配置（含 `lualoader`，少了这个键 skynet 会静默起不来），然后 `exec skynet <config>`。结果是一段 JSON 打到 stdout。
+
+## 正确性
+
+seed 1234，与同机 Go 完全一致（`world_hash` / `damage_total` / `alive_players`）：
+
+| rooms | players | ticks | workload | alloc | world_hash | damage | alive |
+|---|---|---|---|---|---|---|---|
+| 1 | 40 | 200 | medium | arena | `ad2d471bee2634ea` | 6778 | 40 |
+| 1 | 40 | 200 | medium | naive | `ad2d471bee2634ea` | 6778 | 40 |
+| 2 | 12 | 300 | low | naive | `0f5779d90da61806` | 2224 | 24 |
+| 3 | 40 | 200 | high | arena | `ba4a9e097e079029` | 33762 | 120 |
+| 5 | 40 | 400 | medium | arena | `d13ef926b723e826` | 72640 | 200 |
+| 1 | 40 | 1000 | insane | arena | `0114bd6be92d4baf` | 39004 | 6 |
+| 10 | 40 | 600 | medium | arena | `593bcc888f35ecbd` | 210712 | 400 |
+| 100 | 40 | 600 | medium | arena | `b9db0993d8d999dd` | 2100586 | 4000 |
+| 1000 | 40 | 600 | medium | arena | `b61def3711760a01` | 20960766 | 40000 |
+
+## 本机结果（豆包云主机，4 vCPU）
+
+600 tick、40 人、medium、`--spin` 无（skynet 没有忙等），默认 4 worker：
+
+| alloc | 房间 | lag p50 | lag p99 | lag max | 超 50ms | compute p50 | compute p99 | RSS | CPU |
+|---|---|---|---|---|---|---|---|---|---|
+| arena | 1 | 1.42ms | 2.70ms | 2.7ms | 0 | 110µs | 175µs | 14MB | 0.26s |
+| naive | 1 | 1.50ms | 2.74ms | 2.8ms | 0 | 153µs | 250µs | 15MB | 0.30s |
+| arena | 10 | 1.97ms | 4.73ms | 9.6ms | 0 | 100µs | 335µs | 16MB | 0.94s |
+| naive | 10 | 2.14ms | 3.89ms | 11.2ms | 0 | 121µs | 225µs | 17MB | 1.02s |
+| arena | 50 | 3.74ms | 6.30ms | 7.3ms | 0 | 97µs | 149µs | 21MB | 3.43s |
+| naive | 50 | 4.28ms | 7.46ms | 19.1ms | 0 | 116µs | 292µs | 26MB | 4.34s |
+| arena | 100 | 5.46ms | 8.85ms | 13.0ms | 0 | 98µs | 159µs | 28MB | 6.84s |
+| naive | 100 | 5.99ms | 9.56ms | 11.8ms | 0 | 115µs | 194µs | 36MB | 8.10s |
+| Go arena | 100 | 0.71ms | 1.82ms | 6.2ms | 0 | 4µs | — | 5MB | 0.49s |
+
+1000 房、600 tick、medium、arena（同一个 `world_hash=b61def3711760a01`）：
+
+| 版本 | lag p50 | lag p99 | lag p999 | lag max | 超 50ms | compute p99 | RSS | CPU |
+|---|---|---|---|---|---|---|---|---|
+| 4 worker（默认） | 15.7ms | **82.4ms** | 127.7ms | **146.5ms** | **12263** | 253µs | 146MB | 68.4s |
+| 8 worker | 15.4ms | 32.4ms | 64.4ms | 90.9ms | 1177 | 207µs | 156MB | 66.7s |
+| Go 对照 | 1.52ms | 2.64ms | — | 3.58ms | 0 | — | 5MB | 3.69s |
+
+1000 房 8 worker 仍有 0.2% 的帧超预算，p999 64ms：不是内核算不动（compute p99 207µs），是 1000 个 coroutine 在同一 10ms 边界醒来后的排队和偶发 GC。
+
+**这台是 4 vCPU 云主机，和仓库里 Mac Mini M4 / 12 核的历史数据不能横比。**
+
+## 实现说明
+
+- `sim.lua`：内核（RNG、Room、arena/free 数组、naive 表分配），纯 Lua，无 skynet 依赖，可单独 `lua` 跑。
+- `room.lua`：一个房间 service，收 `go` 后 `skynet.fork` 出 tick 循环，结束后把 hash/延迟送回 main。
+- `main.lua`：解析参数、起全部房间、对齐同一个 `start_ns`、收集结果、算分位、打 JSON、退出。
+- `arena`：弹道/buff/event/snapshot 用预分配数组 + 原地压缩，不产生短命表。
+- `naive`：每次 spawn 建 Lua table，snapshot 每帧新建数组，交给 Lua GC。
+- Lua 的 `%` 是 floor-mod，不能直接当无符号余数；`u64mod()` 先拆高低 32 位再加权取模（详见 `NOTES.md`）。
+
+## 已知限制
+
+- `rand` 的 64 位语义依赖 Lua 5.5 整数；换 Lua 5.4 也能跑，换 LuaJIT 不行。
+- tick 间隔受 skynet 10ms 定时器限制，lag 不能和 µs 级 sleep 的语言逐项对比；看 compute 和 missed 比例更公平。
+- `alloc_bytes` / `alloc_objects` 未统计，固定 0；`rss_peak_bytes` 实际是结束时的进程 RSS，不是峰值。
+- `naive` 的对象形状是 Lua table，与 Go 的 struct slice 不同，只能比「分配/复用」这条路径的相对差异，不能当同构分配器。
+- 1000 房默认 4 worker 不达标；这是 Lua 解释器的吞吐上限，不是 skynet 调度器的锅（8 worker 已把超预算压到 0.2%）。
